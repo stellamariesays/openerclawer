@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 opener-clawer — minimal self-hosted AI agent gateway
-https://github.com/stellamariesays/opener-clawer
+https://github.com/stellamariesays/openerclawer
 """
 
 import importlib.util
 import json
 import logging
 import os
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import httpx
@@ -18,9 +20,10 @@ import httpx
 DEFAULTS = {
     "telegram_token": "",
     "anthropic_api_key": "",
-    "model": "claude-sonnet-4-5",
+    "model": "pi",           # "pi" uses pi coding agent; any other value = Anthropic model name
     "workspace": "./workspace",
     "max_tokens": 4096,
+    "pi_bin": "pi",
 }
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -38,6 +41,7 @@ def load_config() -> dict:
         ("anthropic_api_key", "ANTHROPIC_API_KEY"),
         ("model",             "AGENT_MODEL"),
         ("workspace",         "AGENT_WORKSPACE"),
+        ("pi_bin",            "PI_BIN"),
     ]:
         val = os.environ.get(env)
         if val:
@@ -46,16 +50,9 @@ def load_config() -> dict:
 
 
 # ── Context loading ───────────────────────────────────────────────────────────
-#
-# Workspace files can be either:
-#   - <name>.py  — Python module with a context() -> str function (dynamic)
-#   - <NAME>.md  — Plain text / markdown (static)
-#
-# .py is preferred. This lets context be live (pull from APIs, files, DBs)
-# rather than just static markdown.
 
-STATIC_MODULES = ["soul", "agents", "user"]   # loaded once at startup
-LIVE_MODULES   = ["bootstrap", "memory"]       # reloaded every message
+STATIC_MODULES = ["soul", "agents", "user"]
+LIVE_MODULES   = ["bootstrap", "memory"]
 
 
 def load_module(ws: Path, name: str) -> str:
@@ -69,7 +66,7 @@ def load_module(ws: Path, name: str) -> str:
         spec.loader.exec_module(mod)
         if hasattr(mod, "context"):
             return mod.context()
-        return py_path.read_text()  # no context() fn: use source as text
+        return py_path.read_text()
     elif md_path.exists():
         return md_path.read_text()
     return ""
@@ -103,6 +100,70 @@ def call_anthropic(cfg: dict, system: str, history: list) -> str:
     return resp.json()["content"][0]["text"]
 
 
+# ── Pi call ───────────────────────────────────────────────────────────────────
+
+def call_pi(cfg: dict, system: str, history: list) -> str:
+    """
+    Call pi coding agent non-interactively via `pi -p`.
+    Packages system context + conversation history into a single prompt.
+    """
+    # Build a self-contained prompt: system block + conversation turns
+    turns = []
+    for msg in history[-10:]:   # last 10 turns to keep prompt bounded
+        role  = "User" if msg["role"] == "user" else "Assistant"
+        turns.append(f"{role}: {msg['content']}")
+
+    prompt = textwrap.dedent(f"""
+        <system>
+        {system}
+        </system>
+
+        <conversation>
+        {chr(10).join(turns[:-1])}
+        </conversation>
+
+        Respond to the last user message. Be concise.
+
+        {turns[-1]}
+    """).strip()
+
+    pi_bin = cfg.get("pi_bin", "pi")
+    env = os.environ.copy()
+    if cfg.get("anthropic_api_key"):
+        env["ANTHROPIC_API_KEY"] = cfg["anthropic_api_key"]
+
+    try:
+        result = subprocess.run(
+            [pi_bin, "--provider", "anthropic", "-p", prompt],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env=env,
+        )
+        out = result.stdout.strip()
+        if not out and result.stderr:
+            log.warning("pi stderr: %s", result.stderr[:200])
+            out = result.stderr.strip()
+        return out or "(no response from pi)"
+    except subprocess.TimeoutExpired:
+        return "(pi timed out — try again)"
+    except FileNotFoundError:
+        log.error("pi binary not found at: %s", pi_bin)
+        # Fall back to Anthropic if key available
+        if cfg.get("anthropic_api_key"):
+            log.info("Falling back to Anthropic API")
+            return call_anthropic({**cfg, "model": "claude-sonnet-4-5"}, system, history)
+        return "(pi not available)"
+
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+def call_model(cfg: dict, system: str, history: list) -> str:
+    if cfg.get("model", "pi") == "pi":
+        return call_pi(cfg, system, history)
+    return call_anthropic(cfg, system, history)
+
+
 # ── Telegram bot loop ─────────────────────────────────────────────────────────
 
 class Bot:
@@ -115,6 +176,7 @@ class Bot:
         ws = Path(cfg["workspace"])
         self.static = "".join(load_module(ws, m) for m in STATIC_MODULES)
         log.info("Static context loaded (%d chars)", len(self.static))
+        log.info("Model backend: %s", cfg.get("model", "pi"))
 
     def get_updates(self):
         r = httpx.get(
@@ -132,13 +194,13 @@ class Bot:
         )
 
     def run(self):
-        log.info("opener-clawer running — model=%s", self.cfg["model"])
+        log.info("opener-clawer running — model=%s", self.cfg.get("model", "pi"))
         while True:
             try:
                 for update in self.get_updates():
                     self.offset = update["update_id"] + 1
-                    msg    = update.get("message", {})
-                    text   = msg.get("text", "").strip()
+                    msg     = update.get("message", {})
+                    text    = msg.get("text", "").strip()
                     chat_id = msg.get("chat", {}).get("id")
                     if not text or not chat_id:
                         continue
@@ -151,7 +213,7 @@ class Bot:
         history.append({"role": "user", "content": text})
         system = build_system_prompt(self.cfg, self.static)
         try:
-            reply = call_anthropic(self.cfg, system, history[-20:])
+            reply = call_model(self.cfg, system, history[-20:])
         except Exception as e:
             reply = f"Error: {e}"
         history.append({"role": "assistant", "content": reply})
@@ -163,6 +225,4 @@ if __name__ == "__main__":
     cfg = load_config()
     if not cfg["telegram_token"]:
         sys.exit("Set TELEGRAM_TOKEN or telegram_token in config.json")
-    if not cfg["anthropic_api_key"]:
-        sys.exit("Set ANTHROPIC_API_KEY or anthropic_api_key in config.json")
     Bot(cfg).run()
