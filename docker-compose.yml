@@ -1,0 +1,13 @@
+services:
+  agent:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./memory:/app/memory
+    environment:
+      # Override config.json values with env vars if preferred
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AGENT_MODEL=${AGENT_MODEL:-claude-sonnet-4-5}
+      - AGENT_WORKSPACE=/app/workspace

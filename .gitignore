@@ -1,0 +1,9 @@
+config.json
+memory/
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+*.token
+*.key
